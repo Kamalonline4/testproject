@@ -1,0 +1,54 @@
+# Backport gap check configuration
+# Branch names change monthly — prefer auto discovery; pin overrides only when needed.
+#
+# Usage:
+#   python scripts/backport-gap-check/check_backport_gaps.py
+#   python scripts/backport-gap-check/check_backport_gaps.py --config scripts/backport-gap-check/config.yaml
+#   python scripts/backport-gap-check/check_backport_gaps.py --source bugfix/maintenance/45 --target master
+
+remote: origin
+
+# How to resolve moving branches each month
+discovery:
+  # Highest integer N matching bugfix/maintenance/N (excludes 45.1.0, _v2, -pr*, etc.)
+  maintenance:
+    pattern: '^bugfix/maintenance/([0-9]+)$'
+    strategy: highest_int_group_1
+  # Highest semver matching releases/X.Y.Z
+  release_du:
+    pattern: '^releases/([0-9]+)\.([0-9]+)\.([0-9]+)$'
+    strategy: highest_semver
+  # Optional pins — set to null/omit for auto. Uncomment to force a branch for one run.
+  # overrides:
+  #   maintenance: bugfix/maintenance/46
+  #   release_du: releases/45.3.1
+  #   master: master
+
+# Comparisons run every invocation (aliases resolved via discovery)
+comparisons:
+  - name: maintenance-to-master
+    description: Changes on maintenance not yet patch-equivalent on master
+    source: auto:maintenance
+    target: master
+  - name: du-to-maintenance
+    description: Changes on current DU/release not yet patch-equivalent on maintenance
+    source: auto:release_du
+    target: auto:maintenance
+
+# git cherry uses patch-id (correct for cherry-pick backports; ignore commit SHAs)
+report:
+  fail_on_gaps: false          # true = exit 1 when any comparison has missing patches
+  group_by_ticket: true
+  include_authors: true
+  include_open_prs: true       # look for open PRs targeting the comparison target
+  max_commits_listed: 50
+  output_dir: scripts/backport-gap-check/out
+  write_markdown: true
+  write_json: true
+
+# Tickets/paths to ignore when classifying gaps (noise / release-folder-only)
+ignore:
+  commit_message_regexes: []
+  # Example:
+  # - '(?i)retrigger workflow'
+  # - '(?i)merge conflict'

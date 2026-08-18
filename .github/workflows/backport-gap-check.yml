@@ -1,0 +1,72 @@
+name: Backport Gap Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Optional explicit source branch (skips config matrix if both source and target set)"
+        required: false
+        type: string
+      target:
+        description: "Optional explicit target branch"
+        required: false
+        type: string
+      fail_on_gaps:
+        description: "Fail the job when missing patches are found"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Weekly — maintenance/DU branches move monthly; weekly catches drift early
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  backport-gap-check:
+    name: Check cherry-pick backport gaps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Need remotes for discovery of maintenance/releases/*
+          fetch-tags: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Fetch remote branch tips
+        run: |
+          git fetch origin --prune
+          # Ensure discovery patterns are present
+          git ls-remote --heads origin 'bugfix/maintenance/*' 'releases/*' 'master' | head -n 50
+
+      - name: Run gap check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARGS=(--no-fetch)
+          if [ "${{ inputs.fail_on_gaps }}" = "true" ]; then
+            ARGS+=(--fail-on-gaps)
+          fi
+          if [ -n "${{ inputs.source }}" ] && [ -n "${{ inputs.target }}" ]; then
+            ARGS+=(--source "${{ inputs.source }}" --target "${{ inputs.target }}" --name adhoc)
+          fi
+          python scripts/backport-gap-check/check_backport_gaps.py "${ARGS[@]}"
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backport-gap-report
+          path: scripts/backport-gap-check/out/
+          if-no-files-found: warn
