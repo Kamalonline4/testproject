@@ -66,28 +66,49 @@ def remote_branches(remote: str) -> List[str]:
     return names
 
 
+def _match_version(m: "re.Match[str]") -> Tuple[int, int, int]:
+    major = int(m.group(1))
+    minor = int(m.group(2)) if m.lastindex and m.lastindex >= 2 and m.group(2) else 0
+    patch = int(m.group(3)) if m.lastindex and m.lastindex >= 3 and m.group(3) else 0
+    return (major, minor, patch)
+
+
 def resolve_discovery(
-    branches: List[str], rule: Dict[str, Any], overrides: Dict[str, Any], key: str
+    branches: List[str],
+    rule: Dict[str, Any],
+    overrides: Dict[str, Any],
+    key: str,
+    major_filter: Optional[int] = None,
 ) -> str:
     if overrides and overrides.get(key):
         return str(overrides[key])
 
     pattern = re.compile(rule["pattern"])
     strategy = rule.get("strategy", "highest_int_group_1")
-    matches: List[Tuple[Any, str]] = []
 
-    for name in branches:
-        m = pattern.match(name)
-        if not m:
-            continue
-        if strategy == "highest_int_group_1":
-            matches.append((int(m.group(1)), name))
-        elif strategy == "highest_semver":
-            matches.append(
-                ((int(m.group(1)), int(m.group(2)), int(m.group(3))), name)
-            )
-        else:
-            raise ValueError(f"Unknown discovery strategy: {strategy}")
+    def collect(filter_major: Optional[int]) -> List[Tuple[Any, str]]:
+        found: List[Tuple[Any, str]] = []
+        for name in branches:
+            m = pattern.match(name)
+            if not m:
+                continue
+            if strategy == "highest_int_group_1":
+                major = int(m.group(1))
+                if filter_major is not None and major != filter_major:
+                    continue
+                found.append((major, name))
+            elif strategy == "highest_semver":
+                ver = _match_version(m)
+                if filter_major is not None and ver[0] != filter_major:
+                    continue
+                found.append((ver, name))
+            else:
+                raise ValueError(f"Unknown discovery strategy: {strategy}")
+        return found
+
+    matches = collect(major_filter)
+    if not matches and major_filter is not None:
+        matches = collect(None)
 
     if not matches:
         raise RuntimeError(
@@ -361,8 +382,14 @@ def main() -> int:
                 branches, discovery["maintenance"], overrides, "maintenance"
             )
         if "release_du" in discovery:
+            maint_major = None
+            rule = discovery["release_du"]
+            if rule.get("align_major_with") == "maintenance" and "maintenance" in resolved:
+                maj = re.search(r"/([0-9]+)$", resolved["maintenance"])
+                if maj:
+                    maint_major = int(maj.group(1))
             resolved["release_du"] = resolve_discovery(
-                branches, discovery["release_du"], overrides, "release_du"
+                branches, rule, overrides, "release_du", major_filter=maint_major
             )
 
     print("Resolved branches:")
