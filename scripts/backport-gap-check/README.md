@@ -22,12 +22,12 @@ Configured in [`config.yaml`](config.yaml):
 | Name | Source (auto) | Target |
 |------|---------------|--------|
 | `maintenance-to-master` | latest `bugfix/maintenance/{N}` | `master` |
-| `du-to-maintenance` | latest `releases/{X.Y.Z}` | latest maintenance |
+| `du-to-maintenance` | latest `releases/{N}` | latest maintenance |
 
 ### Discovery rules
 
 - **Maintenance**: highest integer matching `^bugfix/maintenance/([0-9]+)$` (e.g. `46`, not `45.1.0` / `_v2` / `-pr*`).
-- **DU/release**: highest semver matching `^releases/([0-9]+)\.([0-9]+)\.([0-9]+)$`.
+- **DU/release**: highest integer matching `^releases/([0-9]+)$` (e.g. `releases/45`, not `releases/45.3.1`).
 
 ### Pin a branch for one month (optional)
 
@@ -37,7 +37,7 @@ In `config.yaml`:
 discovery:
   overrides:
     maintenance: bugfix/maintenance/46
-    release_du: releases/45.3.1
+    release_du: releases/45
     master: master
 ```
 
