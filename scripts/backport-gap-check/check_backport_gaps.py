@@ -79,7 +79,8 @@ def resolve_discovery(
     overrides: Dict[str, Any],
     key: str,
     major_filter: Optional[int] = None,
-) -> str:
+    required: bool = True,
+) -> Optional[str]:
     if overrides and overrides.get(key):
         return str(overrides[key])
 
@@ -107,13 +108,14 @@ def resolve_discovery(
         return found
 
     matches = collect(major_filter)
-    if not matches and major_filter is not None:
-        matches = collect(None)
-
     if not matches:
+        if not required:
+            return None
         raise RuntimeError(
             f"No branches matched discovery for '{key}' "
-            f"(pattern={rule['pattern']!r}). Pin an override in config.yaml."
+            f"(pattern={rule['pattern']!r}"
+            + (f", major={major_filter}" if major_filter is not None else "")
+            + "). Pin an override in config.yaml."
         )
     matches.sort(key=lambda x: x[0])
     return matches[-1][1]
@@ -133,6 +135,14 @@ def resolve_ref(
     else:
         branch = token
     return f"{remote}/{branch}", branch
+
+
+def auto_alias_keys(*tokens: Optional[str]) -> List[str]:
+    keys: List[str] = []
+    for token in tokens:
+        if token and token.startswith("auto:"):
+            keys.append(token.split(":", 1)[1])
+    return keys
 
 
 @dataclass
@@ -271,6 +281,7 @@ def render_markdown(
     results: List[ComparisonResult],
     resolved: Dict[str, str],
     generated_at: str,
+    skipped: Optional[List[str]] = None,
 ) -> str:
     lines: List[str] = []
     lines.append("# Backport gap report")
@@ -281,6 +292,12 @@ def render_markdown(
     lines.append("")
     for k, v in resolved.items():
         lines.append(f"- **{k}**: `{v}`")
+    if skipped:
+        lines.append("")
+        lines.append("## Skipped")
+        lines.append("")
+        for msg in skipped:
+            lines.append(f"- {msg}")
     lines.append("")
     lines.append("Method: `git cherry` (patch-id). Cherry-picked commits with different SHAs count as present.")
     lines.append("")
@@ -332,6 +349,131 @@ def render_markdown(
     return "\n".join(lines) + "\n"
 
 
+def github_run_url() -> Optional[str]:
+    server = os.environ.get("GITHUB_SERVER_URL")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if server and repo and run_id:
+        return f"{server}/{repo}/actions/runs/{run_id}"
+    return None
+
+
+def slack_escape(text: str) -> str:
+    return (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def render_slack_payload(
+    results: List[ComparisonResult],
+    resolved: Dict[str, str],
+    generated_at: str,
+    skipped: Optional[List[str]] = None,
+    max_tickets: int = 8,
+) -> Dict[str, Any]:
+    """Compact Slack Block Kit payload (incoming webhook). Full tables stay in the MD/JSON artifacts."""
+    total_missing = sum(len(r.missing) for r in results)
+    emoji = ":warning:" if total_missing else ":white_check_mark:"
+    title = f"{emoji} Backport gaps: {total_missing} missing patch(es)"
+    resolved_line = "  ".join(f"*{slack_escape(k)}*: `{slack_escape(v)}`" for k, v in resolved.items())
+
+    blocks: List[Dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": title[:150], "emoji": True},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"{slack_escape(generated_at)}  |  {resolved_line or '_none_'}",
+                }
+            ],
+        },
+    ]
+
+    if skipped:
+        skip_text = "\n".join(f"• {slack_escape(s)}" for s in skipped)
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Skipped*\n{skip_text}"[:2900]},
+            }
+        )
+
+    for r in results:
+        groups = group_by_ticket(r.missing)
+        lines = [
+            f"*{slack_escape(r.name)}*",
+            f"`{slack_escape(r.source_branch)}` → `{slack_escape(r.target_branch)}`",
+            f"Missing: *{len(r.missing)}*  |  Equivalent on target: {r.equivalent_count}",
+        ]
+        if r.missing:
+            ticket_items = list(groups.items())
+            for ticket, commits in ticket_items[:max_tickets]:
+                authors = ", ".join(sorted({c.author for c in commits}))
+                lines.append(
+                    f"• *{slack_escape(ticket)}* — {len(commits)} commit(s) — {slack_escape(authors)}"
+                )
+            leftover = len(ticket_items) - max_tickets
+            if leftover > 0:
+                lines.append(f"_…{leftover} more ticket(s)_")
+            if r.open_prs:
+                pr_bits = []
+                for pr in r.open_prs[:5]:
+                    url = pr.get("url") or ""
+                    num = pr.get("number")
+                    if url:
+                        pr_bits.append(f"<{url}|#{num}>")
+                    else:
+                        pr_bits.append(f"#{num}")
+                lines.append("Open PRs: " + ", ".join(pr_bits))
+        else:
+            lines.append("No missing patches.")
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "\n".join(lines)[:2900]},
+            }
+        )
+
+    run_url = github_run_url()
+    if run_url:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"<{run_url}|Open GitHub Actions run>"},
+            }
+        )
+
+    return {"text": title, "blocks": blocks[:50]}
+
+
+def post_slack_webhook(url: str, payload: Dict[str, Any]) -> None:
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            print(f"Posted Slack summary (HTTP {resp.status})")
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        print(f"Slack webhook failed (HTTP {exc.code}): {err}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Slack webhook failed: {exc}", file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check cherry-pick backport gaps")
     parser.add_argument(
@@ -349,6 +491,10 @@ def main() -> int:
         "--fail-on-gaps",
         action="store_true",
         help="Exit 1 if any missing patches (overrides config)",
+    )
+    parser.add_argument(
+        "--slack-webhook",
+        help="Incoming webhook URL (or set SLACK_WEBHOOK_URL). Never commit this value.",
     )
     args = parser.parse_args()
 
@@ -368,29 +514,44 @@ def main() -> int:
             check=False,
         )
 
-    # Ad-hoc --source/--target skips discovery so repos without
-    # bugfix/maintenance/* or releases/* still work (e.g. a test repo).
-    skip_discovery = bool(args.source and args.target)
-
     branches = remote_branches(remote)
     resolved: Dict[str, str] = {}
-    resolved["master"] = overrides.get("master") or "master"
 
-    if not skip_discovery:
-        if "maintenance" in discovery:
-            resolved["maintenance"] = resolve_discovery(
-                branches, discovery["maintenance"], overrides, "maintenance"
-            )
-        if "release_du" in discovery:
-            maint_major = None
-            rule = discovery["release_du"]
-            if rule.get("align_major_with") == "maintenance" and "maintenance" in resolved:
-                maj = re.search(r"/([0-9]+)$", resolved["maintenance"])
-                if maj:
-                    maint_major = int(maj.group(1))
-            resolved["release_du"] = resolve_discovery(
-                branches, rule, overrides, "release_du", major_filter=maint_major
-            )
+    if "maintenance" in discovery:
+        resolved["maintenance"] = resolve_discovery(
+            branches, discovery["maintenance"], overrides, "maintenance"
+        )
+    skipped: List[str] = []
+
+    if "release_du" in discovery:
+        maint_major = None
+        rule = discovery["release_du"]
+        if rule.get("align_major_with") == "maintenance" and "maintenance" in resolved:
+            maj = re.search(r"/([0-9]+)$", resolved["maintenance"])
+            if maj:
+                maint_major = int(maj.group(1))
+        du_branch = resolve_discovery(
+            branches,
+            rule,
+            overrides,
+            "release_du",
+            major_filter=maint_major,
+            required=False,
+        )
+        if du_branch:
+            resolved["release_du"] = du_branch
+        else:
+            if maint_major is not None:
+                skipped.append(
+                    f"DU verification skipped: no `releases/{maint_major}` "
+                    f"(or {maint_major}.Y / {maint_major}.Y.Z) branch found."
+                )
+            else:
+                skipped.append(
+                    "DU verification skipped: no matching `releases/{N}` / `{N.Y}` / `{N.Y.Z}` branch found."
+                )
+            print(skipped[-1])
+    resolved["master"] = overrides.get("master") or "master"
 
     print("Resolved branches:")
     for k, v in resolved.items():
@@ -417,6 +578,20 @@ def main() -> int:
     max_listed = int(report_cfg.get("max_commits_listed", 50))
 
     for cmp in comparisons:
+        unresolved = [
+            k for k in auto_alias_keys(cmp.get("source"), cmp.get("target"))
+            if k not in resolved
+        ]
+        if unresolved:
+            msg = (
+                f"Skipping comparison '{cmp.get('name')}': "
+                f"could not resolve {', '.join('auto:' + k for k in unresolved)}."
+            )
+            if msg not in skipped:
+                skipped.append(msg)
+            print(msg)
+            continue
+
         source_ref, source_branch = resolve_ref(cmp["source"], remote, resolved)
         target_ref, target_branch = resolve_ref(cmp["target"], remote, resolved)
         print(f"\n=== {cmp['name']}: {source_branch} -> {target_branch} ===")
@@ -455,7 +630,7 @@ def main() -> int:
         )
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    md = render_markdown(results, resolved, generated_at)
+    md = render_markdown(results, resolved, generated_at, skipped)
 
     out_dir = Path(report_cfg.get("output_dir", "scripts/backport-gap-check/out"))
     if not out_dir.is_absolute():
@@ -476,6 +651,7 @@ def main() -> int:
         payload = {
             "generated_at": generated_at,
             "resolved_branches": resolved,
+            "skipped": skipped,
             "comparisons": [
                 {
                     "name": r.name,
@@ -496,6 +672,17 @@ def main() -> int:
             json.dumps(payload, indent=2), encoding="utf-8"
         )
         print(f"Wrote {json_path}")
+
+    slack_payload = render_slack_payload(results, resolved, generated_at, skipped)
+    slack_path = out_dir / "backport-gaps-latest.slack.json"
+    slack_path.write_text(json.dumps(slack_payload, indent=2), encoding="utf-8")
+    print(f"Wrote {slack_path}")
+
+    webhook = args.slack_webhook or os.environ.get("SLACK_WEBHOOK_URL") or ""
+    if webhook.strip():
+        post_slack_webhook(webhook.strip(), slack_payload)
+    else:
+        print("Slack skipped (no --slack-webhook / SLACK_WEBHOOK_URL).")
 
     # Always print summary markdown to stdout for Actions step summary
     print("\n" + md)

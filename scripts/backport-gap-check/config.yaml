@@ -16,6 +16,7 @@ discovery:
     strategy: highest_int_group_1
   # Matches releases/46, releases/46.1, and releases/46.1.0; picks highest.
   # align_major_with: use same major as maintenance (46 → releases/46.1.0, not 45.3.1)
+  # If no matching DU/release branch is found, du-to-maintenance is skipped (not a failure).
   release_du:
     pattern: '^releases/([0-9]+)(?:\.([0-9]+)(?:\.([0-9]+))?)?$'
     strategy: highest_semver

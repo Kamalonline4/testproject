@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: false
+      notify_slack:
+        description: "Post compact summary to Slack (needs BACKPORT_GAP_SLACK_WEBHOOK secret)"
+        required: false
+        type: boolean
+        default: true
   schedule:
     # Weekly — maintenance/DU branches move monthly; weekly catches drift early
     - cron: "0 9 * * 1"
@@ -53,6 +58,7 @@ jobs:
       - name: Run gap check
         env:
           GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.BACKPORT_GAP_SLACK_WEBHOOK }}
         run: |
           ARGS=(--no-fetch)
           if [ "${{ inputs.fail_on_gaps }}" = "true" ]; then
@@ -60,6 +66,9 @@ jobs:
           fi
           if [ -n "${{ inputs.source }}" ] && [ -n "${{ inputs.target }}" ]; then
             ARGS+=(--source "${{ inputs.source }}" --target "${{ inputs.target }}" --name adhoc)
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.notify_slack }}" = "false" ]; then
+            unset SLACK_WEBHOOK_URL
           fi
           python scripts/backport-gap-check/check_backport_gaps.py "${ARGS[@]}"
 
